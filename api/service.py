@@ -31,7 +31,7 @@ PINTEREST_PIN_ENDPOINT = (
 
 PINTEREST_BASE_URL = "https://www.pinterest.com"
 
-REQUEST_TIMEOUT = (15, 45)
+REQUEST_TIMEOUT = (5, 15)  # Keep below common Gunicorn 30s timeout
 
 # Direct MP4 targets for fast-start reel playback. The scraper does not
 # download, transcode, mirror, or upload video files. It only saves links.
@@ -478,14 +478,14 @@ def extract_video_variants_recursive(
 def _select_reel_variant_from_variants(
     variants: List[Dict[str, Any]],
     verify: bool = False,
-    allow_hls_fallback: bool = True,
+    allow_hls_fallback: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
-    Prefer a direct MP4 near 720x1280 and ~2 Mbps.
+    Return only a direct MP4 near 720x1280 and ~2 Mbps.
 
-    If Pinterest exposes no direct MP4 and allow_hls_fallback=True, return an
-    HLS manifest instead. This keeps the scraper link-only: no video files are
-    downloaded, transcoded, mirrored, or uploaded.
+    ``allow_hls_fallback`` is retained only for backward compatibility with
+    older view code and is intentionally ignored. HLS URLs are never returned
+    by the normal MP4-only scraping path.
     """
     mp4_variants = [
         variant
@@ -539,31 +539,14 @@ def _select_reel_variant_from_variants(
         if not verify or video_url_is_working(variant["url"]):
             return variant
 
-    if not allow_hls_fallback:
-        return None
-
-    hls_variants = [
-        variant
-        for variant in variants
-        if variant.get("stream_type") == "hls"
-        and variant.get("url")
-    ]
-
-    # Prefer a known ~720p rendition when Pinterest exposes multiple HLS
-    # manifests; otherwise the first manifest is normally a master playlist.
-    hls_variants.sort(key=reel_score)
-
-    for variant in hls_variants:
-        if not verify or video_url_is_working(variant["url"]):
-            return variant
-
+    # Strict MP4-only mode. Never return Pinterest HLS manifests.
     return None
 
 
 def select_best_video_variant_from_pin_data(
     pin_data: Dict[str, Any],
     verify: bool = False,
-    allow_hls_fallback: bool = True,
+    allow_hls_fallback: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Find the best playable video link anywhere in a Pin payload."""
     return _select_reel_variant_from_variants(
@@ -596,7 +579,7 @@ def video_url_is_working(
             headers=headers,
             stream=True,
             allow_redirects=True,
-            timeout=(10, 25),
+            timeout=(3, 5),
         ) as response:
 
             if response.status_code not in {
@@ -671,9 +654,9 @@ def video_url_is_working(
 def select_best_video_variant(
     video_list: Dict[str, Any],
     verify: bool = False,
-    allow_hls_fallback: bool = True,
+    allow_hls_fallback: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Prefer direct MP4 and optionally fall back to HLS."""
+    """Return the best direct MP4; never return HLS."""
     return _select_reel_variant_from_variants(
         extract_video_variants(video_list),
         verify=verify,
@@ -1339,12 +1322,14 @@ def save_pinterest_pin(
     replace_existing_tags: bool = False,
     replace_existing_countries: bool = True,
     verify_url: bool = False,
-    allow_hls_fallback: bool = True,
+    allow_hls_fallback: bool = False,
 ) -> Dict[str, Any]:
     """
-    Create or update one Pinterest video and assign its
-    category, tags and countries. Direct MP4 is preferred; HLS is used only
-    when Pinterest exposes no MP4. No video file is downloaded or uploaded.
+    Create or update one Pinterest video using a direct MP4 URL only.
+
+    No HLS fallback, Pin detail request, media download, FFmpeg conversion,
+    or storage upload is performed. ``allow_hls_fallback`` is accepted only
+    so older API view code does not break; it is intentionally ignored.
     """
 
     pin_id = str(
@@ -1363,34 +1348,18 @@ def save_pinterest_pin(
     # timeout when scraping 20+ videos.
     effective_pin_data = pin_data
 
-    # First preference: direct MP4 from the search payload.
+    # Strict MP4-only selection from the search payload.
+    # Never fetch PinResource / Pin HTML here: that per-Pin fallback was the
+    # cause of the Gunicorn worker timeout.
     variant = select_best_video_variant_from_pin_data(
         pin_data,
         verify=verify_url,
         allow_hls_fallback=False,
     )
 
-    # Fast link-only fallback: if there is no MP4 in the search payload,
-    # immediately use an HLS URL already returned by Pinterest.
-    if not variant and allow_hls_fallback:
-        variant = select_best_video_variant_from_pin_data(
-            pin_data,
-            verify=verify_url,
-            allow_hls_fallback=True,
-        )
-
     if not variant:
-        discovered = extract_video_variants_recursive(
-            effective_pin_data
-        )
-        discovered_types = sorted({
-            item.get("stream_type", "unknown")
-            for item in discovered
-        })
-
         raise PinterestScraperError(
-            f"No usable video link found for Pin {pin_id}. "
-            f"Discovered stream types: {discovered_types or ['none']}."
+            f"No direct MP4 variant in Pinterest search response for Pin {pin_id}."
         )
 
     existing_video = (
@@ -1513,31 +1482,34 @@ def scrape_and_save_pinterest_videos(
     replace_existing_tags: bool = False,
     replace_existing_countries: bool = True,
     verify_urls: bool = False,
-    allow_hls_fallback: bool = True,
+    allow_hls_fallback: bool = False,
 ) -> Dict[str, Any]:
     """
-    Search Pinterest and save videos with tags and countries.
+    Search Pinterest and save direct-MP4 videos with tags and countries.
 
     The search query is automatically used as a fallback tag
     when Pinterest does not return annotations.
     """
-
-    response_data = get_pinterest_videos(
-        query=query,
-        num_scrape=num_scrape,
-        cookie_header=cookie_header,
-    )
-
-    search_results = extract_search_results(
-        response_data
-    )
 
     try:
         requested_limit = max(1, min(int(num_scrape), 100))
     except (TypeError, ValueError):
         requested_limit = 10
 
-    search_results = search_results[:requested_limit]
+    # Pinterest search payloads often expose HLS only. To improve the chance
+    # of finding the requested number of direct MP4 links without making
+    # per-Pin requests, ask for a larger candidate pool in this ONE search.
+    candidate_limit = min(100, max(requested_limit, requested_limit * 4))
+
+    response_data = get_pinterest_videos(
+        query=query,
+        num_scrape=candidate_limit,
+        cookie_header=cookie_header,
+    )
+
+    search_results = extract_search_results(
+        response_data
+    )[:candidate_limit]
 
     fallback_tag_names = [
         str(query).strip()
@@ -1564,12 +1536,34 @@ def scrape_and_save_pinterest_videos(
     updated_count = 0
     skipped_count = 0
     mp4_count = 0
-    hls_count = 0
     errors = []
     all_assigned_tags = set()
     all_assigned_countries = set()
 
+    mp4_candidates = 0
+
     for pin_data in search_results:
+        # Stop as soon as the requested number of MP4 records is saved.
+        if created_count + updated_count >= requested_limit:
+            break
+
+        # Local-only prefilter: skip HLS-only results immediately. No network
+        # request is made here.
+        local_variant = select_best_video_variant_from_pin_data(
+            pin_data,
+            verify=False,
+            allow_hls_fallback=False,
+        )
+        if not local_variant:
+            skipped_count += 1
+            errors.append({
+                "pin_id": pin_data.get("id"),
+                "error": "No direct MP4 in Pinterest search response.",
+            })
+            continue
+
+        mp4_candidates += 1
+
         try:
             result = save_pinterest_pin(
                 pin_data=pin_data,
@@ -1589,7 +1583,7 @@ def scrape_and_save_pinterest_videos(
                     replace_existing_countries
                 ),
                 verify_url=verify_urls,
-                allow_hls_fallback=allow_hls_fallback,
+                allow_hls_fallback=False,
             )
 
             all_assigned_tags.update(
@@ -1606,8 +1600,6 @@ def scrape_and_save_pinterest_videos(
 
             if result.get("stream_type") == "mp4":
                 mp4_count += 1
-            elif result.get("stream_type") == "hls":
-                hls_count += 1
 
         except Exception as exc:
             skipped_count += 1
@@ -1619,7 +1611,9 @@ def scrape_and_save_pinterest_videos(
 
     return {
         "status": "success",
-        "received": len(search_results),
+        "requested": requested_limit,
+        "candidate_pool": len(search_results),
+        "mp4_candidates": mp4_candidates,
         "created": created_count,
         "updated": updated_count,
         "skipped": skipped_count,
@@ -1627,7 +1621,7 @@ def scrape_and_save_pinterest_videos(
             created_count + updated_count
         ),
         "mp4_saved": mp4_count,
-        "hls_saved": hls_count,
+        "hls_saved": 0,
         "tags": sorted(all_assigned_tags),
         "countries": sorted(
             all_assigned_countries
