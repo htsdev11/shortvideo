@@ -1356,53 +1356,28 @@ def save_pinterest_pin(
             "Pinterest result has no Pin ID."
         )
 
+    # IMPORTANT FOR API SPEED:
+    # Only use links already present in the Pinterest search response.
+    # Do NOT call fetch_fresh_pin_data() here. Doing a PinResource/page
+    # request for every search result can easily exceed Gunicorn's request
+    # timeout when scraping 20+ videos.
     effective_pin_data = pin_data
 
-    # First inspect the search result recursively for a direct MP4.
+    # First preference: direct MP4 from the search payload.
     variant = select_best_video_variant_from_pin_data(
-        effective_pin_data,
+        pin_data,
         verify=verify_url,
         allow_hls_fallback=False,
     )
 
-    # Search responses often only include HLS. Fetch the fresh Pin detail and
-    # try once more for a direct MP4 before accepting HLS.
-    if not variant:
-        try:
-            fresh_pin_data = fetch_fresh_pin_data(
-                pin_id=pin_id,
-                cookie_header=cookie_header,
-            )
-        except PinterestScraperError:
-            fresh_pin_data = None
-
-        if fresh_pin_data:
-            effective_pin_data = fresh_pin_data
-            variant = select_best_video_variant_from_pin_data(
-                effective_pin_data,
-                verify=verify_url,
-                allow_hls_fallback=False,
-            )
-
-    # Link-only fallback. If Pinterest genuinely exposes no MP4, save HLS
-    # instead of dropping the video completely.
+    # Fast link-only fallback: if there is no MP4 in the search payload,
+    # immediately use an HLS URL already returned by Pinterest.
     if not variant and allow_hls_fallback:
         variant = select_best_video_variant_from_pin_data(
-            effective_pin_data,
+            pin_data,
             verify=verify_url,
             allow_hls_fallback=True,
         )
-
-        # If fresh detail failed and the original search result had the HLS
-        # manifest, try the original payload as the final fallback.
-        if not variant and effective_pin_data is not pin_data:
-            variant = select_best_video_variant_from_pin_data(
-                pin_data,
-                verify=verify_url,
-                allow_hls_fallback=True,
-            )
-            if variant:
-                effective_pin_data = pin_data
 
     if not variant:
         discovered = extract_video_variants_recursive(
@@ -1518,6 +1493,8 @@ def save_pinterest_pin(
         "pin_id": pin_id,
         "tags": assigned_tags,
         "countries": assigned_countries,
+        "stream_type": variant.get("stream_type"),
+        "url": variant.get("url"),
     }
 
 
@@ -1586,6 +1563,8 @@ def scrape_and_save_pinterest_videos(
     created_count = 0
     updated_count = 0
     skipped_count = 0
+    mp4_count = 0
+    hls_count = 0
     errors = []
     all_assigned_tags = set()
     all_assigned_countries = set()
@@ -1625,6 +1604,11 @@ def scrape_and_save_pinterest_videos(
             else:
                 updated_count += 1
 
+            if result.get("stream_type") == "mp4":
+                mp4_count += 1
+            elif result.get("stream_type") == "hls":
+                hls_count += 1
+
         except Exception as exc:
             skipped_count += 1
 
@@ -1642,6 +1626,8 @@ def scrape_and_save_pinterest_videos(
         "total_saved": (
             created_count + updated_count
         ),
+        "mp4_saved": mp4_count,
+        "hls_saved": hls_count,
         "tags": sorted(all_assigned_tags),
         "countries": sorted(
             all_assigned_countries
@@ -1725,7 +1711,7 @@ def refresh_pinterest_video_link(
 
         if not fresh_variant:
             raise PinterestScraperError(
-                f"Pinterest returned no working direct MP4 "
+                f"Pinterest returned no working video "
                 f"URL for Pin {pin_id}."
             )
 
