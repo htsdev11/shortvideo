@@ -6,7 +6,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .functions import (
+from .service import (
     PinterestScraperError,
     parse_boolean,
     refresh_expired_pinterest_videos,
@@ -17,6 +17,79 @@ from .models import Video, VideoCategory, Tag
 from .pagination import CustomPagination
 from .serializers import VideoSerializer, VideoCategorySerializer, TagSerializer
 
+
+# class ScrapePinterestVideos(APIView):
+#     authentication_classes = [TokenAuthentication]
+#     permission_classes = [IsAuthenticated]
+#
+#     def post(self, request):
+#         try:
+#             query = (
+#                 request.data.get("query")
+#                 or request.data.get("secondary")
+#             )
+#
+#             num_scrape = request.data.get("to_scrape", 10)
+#
+#             category_name = (
+#                 request.data.get("category")
+#                 or request.data.get("video_type")
+#                 or "Video"
+#             )
+#
+#             category, _ = VideoCategory.objects.get_or_create(
+#                 name=str(category_name).capitalize()
+#             )
+#
+#             # Do not read the Pinterest cookie from request.data or settings.
+#             # functions.py will use its internal PINTEREST_COOKIE constant.
+#             result = scrape_and_save_pinterest_videos(
+#                 query=query,
+#                 num_scrape=num_scrape,
+#                 cookie_header=None,
+#                 category=category,
+#                 assign_all_countries=parse_boolean(
+#                     request.data.get(
+#                         "assign_all_countries",
+#                         True,
+#                     )
+#                 ),
+#                 verify_urls=parse_boolean(
+#                     request.data.get(
+#                         "verify_urls",
+#                         False,
+#                     )
+#                 ),
+#             )
+#
+#             return Response(
+#                 {
+#                     "status": "success",
+#                     "message": None,
+#                     "data": result,
+#                 },
+#                 status=status.HTTP_201_CREATED,
+#             )
+#
+#         except PinterestScraperError as exc:
+#             return Response(
+#                 {
+#                     "status": "failed",
+#                     "message": str(exc),
+#                     "data": None,
+#                 },
+#                 status=status.HTTP_400_BAD_REQUEST,
+#             )
+#
+#         except Exception as exc:
+#             return Response(
+#                 {
+#                     "status": "failed",
+#                     "message": str(exc),
+#                     "data": None,
+#                 },
+#                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             )
 
 class ScrapePinterestVideos(APIView):
     authentication_classes = [TokenAuthentication]
@@ -29,7 +102,25 @@ class ScrapePinterestVideos(APIView):
                 or request.data.get("secondary")
             )
 
-            num_scrape = request.data.get("to_scrape", 10)
+            if not query:
+                return Response(
+                    {
+                        "status": "failed",
+                        "message": "query is required.",
+                        "data": None,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            try:
+                num_scrape = int(
+                    request.data.get("to_scrape", 10)
+                )
+            except (TypeError, ValueError):
+                num_scrape = 10
+
+            # Optional safety limit
+            num_scrape = max(1, min(num_scrape, 100))
 
             category_name = (
                 request.data.get("category")
@@ -41,25 +132,27 @@ class ScrapePinterestVideos(APIView):
                 name=str(category_name).capitalize()
             )
 
-            # Do not read the Pinterest cookie from request.data or settings.
-            # functions.py will use its internal PINTEREST_COOKIE constant.
             result = scrape_and_save_pinterest_videos(
                 query=query,
                 num_scrape=num_scrape,
                 cookie_header=None,
                 category=category,
+
                 assign_all_countries=parse_boolean(
                     request.data.get(
                         "assign_all_countries",
                         True,
                     )
                 ),
+
                 verify_urls=parse_boolean(
                     request.data.get(
                         "verify_urls",
                         False,
                     )
                 ),
+
+                allow_hls_fallback=True,
             )
 
             return Response(
@@ -90,7 +183,6 @@ class ScrapePinterestVideos(APIView):
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-
 
 class RefreshPinterestVideos(APIView):
     authentication_classes = [TokenAuthentication]
