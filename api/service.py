@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from http.cookies import SimpleCookie
 from urllib.parse import quote_plus, urlparse
@@ -31,7 +33,10 @@ PINTEREST_PIN_ENDPOINT = (
 
 PINTEREST_BASE_URL = "https://www.pinterest.com"
 
-REQUEST_TIMEOUT = (5, 15)  # Keep below common Gunicorn 30s timeout
+REQUEST_TIMEOUT = (5, 15)
+PIN_RESOURCE_TIMEOUT = (2, 4)
+PIN_RESOURCE_WORKERS = 8
+PIN_RESOURCE_DEADLINE_SECONDS = 18
 
 # Direct MP4 targets for fast-start reel playback. The scraper does not
 # download, transcode, mirror, or upload video files. It only saves links.
@@ -731,6 +736,114 @@ def find_pin_data_recursively(
 
             if result:
                 return result
+
+    return None
+
+
+def fetch_pin_from_resource_fast(
+    pin_id: str,
+    cookie_header: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fast PinResource lookup used only by the synchronous scrape endpoint.
+
+    It performs ONE bounded JSON request and NEVER falls back to loading the
+    Pinterest HTML Pin page. This keeps a batch request inside Gunicorn's
+    request window while still giving HLS-only search results one chance to
+    expose a direct MP4 from richer Pin metadata.
+    """
+    session = create_pinterest_session(cookie_header)
+
+    params = {
+        "source_url": f"/pin/{pin_id}/",
+        "data": json.dumps({
+            "options": {
+                "id": str(pin_id),
+                "field_set_key": "auth_web_main_pin",
+            },
+            "context": {},
+        }),
+    }
+
+    try:
+        response = session.get(
+            PINTEREST_PIN_ENDPOINT,
+            params=params,
+            headers={
+                "Accept": (
+                    "application/json, text/javascript, "
+                    "*/*; q=0.01"
+                ),
+            },
+            timeout=PIN_RESOURCE_TIMEOUT,
+        )
+        response.raise_for_status()
+        response_data = response.json()
+    except (requests.RequestException, ValueError):
+        return None
+    finally:
+        session.close()
+
+    pin_data = find_pin_data_recursively(
+        response_data,
+        str(pin_id),
+    )
+
+    if pin_data:
+        return pin_data
+
+    resource_data = (
+        response_data
+        .get("resource_response", {})
+        .get("data")
+    )
+
+    if isinstance(resource_data, dict):
+        return resource_data
+
+    return None
+
+
+def resolve_direct_mp4_pin_data(
+    pin_data: Dict[str, Any],
+    cookie_header: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return Pin data containing a direct MP4.
+
+    Search metadata is checked first with no network request. If it only has
+    HLS, perform one fast PinResource lookup. HLS is never returned as the
+    selected playback source.
+    """
+    local_variant = select_best_video_variant_from_pin_data(
+        pin_data,
+        verify=False,
+        allow_hls_fallback=False,
+    )
+
+    if local_variant:
+        return pin_data
+
+    pin_id = str(pin_data.get("id") or "")
+    if not pin_id:
+        return None
+
+    fresh_pin_data = fetch_pin_from_resource_fast(
+        pin_id=pin_id,
+        cookie_header=cookie_header,
+    )
+
+    if not fresh_pin_data:
+        return None
+
+    fresh_variant = select_best_video_variant_from_pin_data(
+        fresh_pin_data,
+        verify=False,
+        allow_hls_fallback=False,
+    )
+
+    if fresh_variant:
+        return fresh_pin_data
 
     return None
 
@@ -1485,20 +1598,25 @@ def scrape_and_save_pinterest_videos(
     allow_hls_fallback: bool = False,
 ) -> Dict[str, Any]:
     """
-    Search Pinterest and save direct-MP4 videos with tags and countries.
+    Search Pinterest and save direct MP4 links only.
 
-    The search query is automatically used as a fallback tag
-    when Pinterest does not return annotations.
+    Fast path:
+      1. One Pinterest search request.
+      2. Save direct MP4s already present in the search response.
+      3. For HLS-only candidates, do ONE PinResource JSON lookup in parallel.
+      4. Never load the Pinterest HTML Pin page.
+      5. Never save .m3u8.
+
+    The parallel lookup stage has a global deadline so a slow Pinterest
+    response does not hold a synchronous Gunicorn worker indefinitely.
     """
-
     try:
         requested_limit = max(1, min(int(num_scrape), 100))
     except (TypeError, ValueError):
         requested_limit = 10
 
-    # Pinterest search payloads often expose HLS only. To improve the chance
-    # of finding the requested number of direct MP4 links without making
-    # per-Pin requests, ask for a larger candidate pool in this ONE search.
+    # Pinterest may ignore/cap this value, but requesting a larger pool gives
+    # us the best chance of finding enough direct MP4 candidates in one search.
     candidate_limit = min(100, max(requested_limit, requested_limit * 4))
 
     response_data = get_pinterest_videos(
@@ -1507,30 +1625,17 @@ def scrape_and_save_pinterest_videos(
         cookie_header=cookie_header,
     )
 
-    search_results = extract_search_results(
-        response_data
-    )[:candidate_limit]
+    search_results = extract_search_results(response_data)[:candidate_limit]
 
-    fallback_tag_names = [
-        str(query).strip()
-    ]
-
+    fallback_tag_names = [str(query).strip()]
     for tag_name in default_tag_names or []:
-        normalized_tag = normalize_tag_name(
-            tag_name
-        )
-
+        normalized_tag = normalize_tag_name(tag_name)
         if (
             normalized_tag
             and normalized_tag.casefold()
-            not in {
-                value.casefold()
-                for value in fallback_tag_names
-            }
+            not in {value.casefold() for value in fallback_tag_names}
         ):
-            fallback_tag_names.append(
-                normalized_tag
-            )
+            fallback_tag_names.append(normalized_tag)
 
     created_count = 0
     updated_count = 0
@@ -1540,92 +1645,135 @@ def scrape_and_save_pinterest_videos(
     all_assigned_tags = set()
     all_assigned_countries = set()
 
-    mp4_candidates = 0
+    # First consume direct MP4s from the search response without any extra
+    # Pinterest request. Keep unresolved Pins for bounded parallel lookup.
+    resolved_pin_data: List[Dict[str, Any]] = []
+    unresolved_pin_data: List[Dict[str, Any]] = []
 
     for pin_data in search_results:
-        # Stop as soon as the requested number of MP4 records is saved.
-        if created_count + updated_count >= requested_limit:
-            break
-
-        # Local-only prefilter: skip HLS-only results immediately. No network
-        # request is made here.
         local_variant = select_best_video_variant_from_pin_data(
             pin_data,
             verify=False,
             allow_hls_fallback=False,
         )
-        if not local_variant:
-            skipped_count += 1
-            errors.append({
-                "pin_id": pin_data.get("id"),
-                "error": "No direct MP4 in Pinterest search response.",
-            })
-            continue
+        if local_variant:
+            resolved_pin_data.append(pin_data)
+        else:
+            unresolved_pin_data.append(pin_data)
 
-        mp4_candidates += 1
+    # Pinterest search currently often exposes HLS only. Resolve those
+    # candidates through PinResource concurrently, never through the HTML page.
+    if (
+        len(resolved_pin_data) < requested_limit
+        and unresolved_pin_data
+    ):
+        needed = requested_limit - len(resolved_pin_data)
+        deadline = time.monotonic() + PIN_RESOURCE_DEADLINE_SECONDS
+        executor = ThreadPoolExecutor(max_workers=PIN_RESOURCE_WORKERS)
+        futures = {
+            executor.submit(
+                resolve_direct_mp4_pin_data,
+                pin_data,
+                cookie_header,
+            ): pin_data
+            for pin_data in unresolved_pin_data
+        }
+
+        try:
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                completed = as_completed(futures, timeout=remaining)
+                for future in completed:
+                    original_pin = futures[future]
+
+                    if len(resolved_pin_data) >= requested_limit:
+                        break
+
+                    try:
+                        fresh_pin_data = future.result()
+                    except Exception as exc:
+                        errors.append({
+                            "pin_id": original_pin.get("id"),
+                            "error": f"PinResource lookup failed: {exc}",
+                        })
+                        continue
+
+                    if fresh_pin_data:
+                        resolved_pin_data.append(fresh_pin_data)
+                    else:
+                        errors.append({
+                            "pin_id": original_pin.get("id"),
+                            "error": "No direct MP4 found in search or PinResource response.",
+                        })
+            except TimeoutError:
+                pass
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    # Save only as many MP4s as the caller requested. Database work remains in
+    # the request thread; Django ORM connections are not shared with workers.
+    for pin_data in resolved_pin_data:
+        if created_count + updated_count >= requested_limit:
+            break
 
         try:
             result = save_pinterest_pin(
                 pin_data=pin_data,
                 cookie_header=cookie_header,
                 category=category,
-                assign_all_countries=(
-                    assign_all_countries
-                ),
+                assign_all_countries=assign_all_countries,
                 country_codes=country_codes,
-                fallback_tag_names=(
-                    fallback_tag_names
-                ),
-                replace_existing_tags=(
-                    replace_existing_tags
-                ),
-                replace_existing_countries=(
-                    replace_existing_countries
-                ),
-                verify_url=verify_urls,
+                fallback_tag_names=fallback_tag_names,
+                replace_existing_tags=replace_existing_tags,
+                replace_existing_countries=replace_existing_countries,
+                # Keep verification off for the synchronous scrape path. A
+                # verification request per video can recreate timeout pressure.
+                verify_url=False,
                 allow_hls_fallback=False,
             )
 
-            all_assigned_tags.update(
-                result.get("tags", [])
-            )
-            all_assigned_countries.update(
-                result.get("countries", [])
-            )
+            all_assigned_tags.update(result.get("tags", []))
+            all_assigned_countries.update(result.get("countries", []))
 
             if result["created"]:
                 created_count += 1
             else:
                 updated_count += 1
 
-            if result.get("stream_type") == "mp4":
-                mp4_count += 1
+            mp4_count += 1
 
         except Exception as exc:
             skipped_count += 1
-
             errors.append({
                 "pin_id": pin_data.get("id"),
                 "error": str(exc),
             })
 
+    attempted_pin_ids = {
+        str(item.get("id") or "")
+        for item in resolved_pin_data
+    }
+    for pin_data in search_results:
+        pin_id = str(pin_data.get("id") or "")
+        if pin_id and pin_id not in attempted_pin_ids:
+            skipped_count += 1
+
     return {
         "status": "success",
         "requested": requested_limit,
         "candidate_pool": len(search_results),
-        "mp4_candidates": mp4_candidates,
+        "mp4_candidates": len(resolved_pin_data),
         "created": created_count,
         "updated": updated_count,
         "skipped": skipped_count,
-        "total_saved": (
-            created_count + updated_count
-        ),
+        "total_saved": created_count + updated_count,
         "mp4_saved": mp4_count,
         "hls_saved": 0,
         "tags": sorted(all_assigned_tags),
-        "countries": sorted(
-            all_assigned_countries
-        ),
+        "countries": sorted(all_assigned_countries),
         "errors": errors,
     }
 
